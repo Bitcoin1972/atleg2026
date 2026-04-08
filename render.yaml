@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: atleg2026-report
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false          # fill in Render dashboard
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
