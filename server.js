@@ -15,14 +15,15 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// Data paths
+// ── GUESTBOOK: persisted to local JSON
+// NOTE: Guestbook entries will still reset on Render restarts.
+// For persistence, migrate to a free DB (MongoDB Atlas, Render Postgres, etc.)
+// Photos are now fully persistent via Cloudinary — no local file needed.
 const DATA_DIR = path.join(__dirname, 'data');
 const GB_FILE  = path.join(DATA_DIR, 'guestbook.json');
-const PHO_FILE = path.join(DATA_DIR, 'photos.json');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(GB_FILE))  fs.writeFileSync(GB_FILE,  '[]');
-if (!fs.existsSync(PHO_FILE)) fs.writeFileSync(PHO_FILE, '[]');
+if (!fs.existsSync(GB_FILE))  fs.writeFileSync(GB_FILE, '[]');
 
 // Middleware
 app.use(cors());
@@ -39,8 +40,8 @@ const upload = multer({
   }
 });
 
-function readJSON(f)       { try { return JSON.parse(fs.readFileSync(f,'utf8')); } catch { return []; } }
-function writeJSON(f, d)   { fs.writeFileSync(f, JSON.stringify(d, null, 2)); }
+function readJSON(f)     { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return []; } }
+function writeJSON(f, d) { fs.writeFileSync(f, JSON.stringify(d, null, 2)); }
 
 // ── GUESTBOOK ──────────────────────────────────────────────────────────────
 app.get('/api/guestbook', (req, res) => {
@@ -53,15 +54,15 @@ app.get('/api/guestbook', (req, res) => {
 
 app.post('/api/guestbook', (req, res) => {
   const { name, title, email, msg } = req.body;
-  if (!name?.trim())          return res.status(400).json({ error: 'Name is required.' });
-  if (!email?.includes('@'))  return res.status(400).json({ error: 'Valid email required.' });
-  if (!msg?.trim())           return res.status(400).json({ error: 'Message is required.' });
+  if (!name?.trim())         return res.status(400).json({ error: 'Name is required.' });
+  if (!email?.includes('@')) return res.status(400).json({ error: 'Valid email required.' });
+  if (!msg?.trim())          return res.status(400).json({ error: 'Message is required.' });
 
   const entries = readJSON(GB_FILE);
   const entry = {
     id:    Date.now(),
     name:  name.trim().slice(0, 120),
-    title: (title||'').trim().slice(0, 150),
+    title: (title || '').trim().slice(0, 150),
     email: email.trim().slice(0, 200),
     msg:   msg.trim().slice(0, 2000),
     date:  new Date().toISOString()
@@ -72,9 +73,34 @@ app.post('/api/guestbook', (req, res) => {
   res.json({ success: true, entry: safe });
 });
 
-// ── PHOTOS via Cloudinary ──────────────────────────────────────────────────
-app.get('/api/photos', (req, res) => {
-  res.json(readJSON(PHO_FILE).slice().reverse());
+// ── PHOTOS via Cloudinary (persistent — no local file) ─────────────────────
+//
+// Caption and uploader are stored as Cloudinary context tags so they
+// survive server restarts without any database.
+
+app.get('/api/photos', async (req, res) => {
+  try {
+    const result = await cloudinary.search
+      .expression('folder:atleg2026')
+      .with_field('context')
+      .sort_by('created_at', 'desc')
+      .max_results(100)
+      .execute();
+
+    const photos = result.resources.map(r => ({
+      id:        r.asset_id,
+      url:       r.secure_url,
+      public_id: r.public_id,
+      caption:   r.context?.custom?.caption  || '',
+      uploader:  r.context?.custom?.uploader || '',
+      date:      r.created_at
+    }));
+
+    res.json(photos);
+  } catch (err) {
+    console.error('Cloudinary search error:', err.message);
+    res.status(500).json({ error: 'Could not load photos.' });
+  }
 });
 
 app.post('/api/photos', upload.single('photo'), async (req, res) => {
@@ -85,26 +111,29 @@ app.post('/api/photos', upload.single('photo'), async (req, res) => {
   try {
     const result = await new Promise((resolve, reject) => {
       const stream = cloudinary.uploader.upload_stream(
-        { folder: 'atleg2026', resource_type: 'image' },
+        {
+          folder:        'atleg2026',
+          resource_type: 'image',
+          // Store caption + uploader as Cloudinary context — persists forever
+          context: `caption=${(caption || '').trim().slice(0, 300)}|uploader=${uploader.trim().slice(0, 120)}`
+        },
         (err, r) => err ? reject(err) : resolve(r)
       );
       stream.end(req.file.buffer);
     });
 
-    const photos = readJSON(PHO_FILE);
     const photo = {
-      id:        Date.now(),
+      id:        result.asset_id,
       url:       result.secure_url,
       public_id: result.public_id,
-      caption:   (caption||'').trim().slice(0, 300),
+      caption:   (caption || '').trim().slice(0, 300),
       uploader:  uploader.trim().slice(0, 120),
-      date:      new Date().toISOString()
+      date:      result.created_at
     };
-    photos.push(photo);
-    writeJSON(PHO_FILE, photos);
+
     res.json({ success: true, photo });
-  } catch(err) {
-    console.error('Cloudinary error:', err.message);
+  } catch (err) {
+    console.error('Cloudinary upload error:', err.message);
     res.status(500).json({ error: 'Upload failed. Please try again.' });
   }
 });
